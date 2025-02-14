@@ -1,0 +1,565 @@
+---
+title: "Figure code for: Simple metric for predicting the timing of river phytoplankton blooms"
+author: "Nicholas Bruns"
+date: "01/29/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+This script produces all figures shown in Ecosphere manuscript "Simple metric for predicting the timing of river phytoplankton blooms." Data is prepared from public USGS data in accompanying script, "prepare_ms_data.Rmd". Here, the exact version of data used in manuscript is downloaded from Figshare. T/Q metric is also referred to as "bloomstat" throughout code.
+
+
+```{r general_setup, warning = FALSE, message = FALSE, echo=FALSE, include=FALSE}
+library(caret)
+library(tidyverse)
+library(lubridate)
+library(patchwork)
+library(RColorBrewer)
+  
+theme_set(theme_classic(base_size=14))
+knitr::opts_chunk$set(
+  warning = FALSE, 
+  message = FALSE, 
+  echo = FALSE,
+  cache = TRUE 
+  )
+
+super_gage_sites <- tribble(~site_id, ~site_name,~position_number,
+  "06887500", "Wamego_1",1,
+  "06888990", "Topeka_water_plant_2",2,
+  "06892350", "DeSoto_3",3,
+  "06892518", "Lake_Quivera_4",4
+  )
+```
+
+
+
+```{r data-processing, include=FALSE}
+download.file("https://ndownloader.figshare.com/files/26628104",destfile = "gage_data_processed.RData")
+load("gage_data_processed.RData")
+glimpse(time_series_all_sites_list)
+#load data
+daily_3_gage_data <-   time_series_all_sites_list %>% 
+  map_dfr(rbind) %>% 
+  left_join(super_gage_sites) %>% 
+  filter(site_name !="Topeka_water_plant_2" ) %>% #this site has very recent record, drop for the analysis
+  mutate(date=as_date(dateTime)) %>% 
+  group_by(site_name,date) %>% 
+  summarize(median_chl_conc=median(chl_a,na.rm=T),
+           median_discharge=median(discharge,na.rm=T),
+           median_velocity=median(modeled_velocity,na.rm=T), 
+           median_temperature=median(temperature,na.rm=T), 
+           median_nitrate=median(nitrate_suna,na.rm=T),  #only at Desoto
+           median_turbidity=median(turbidity,na.rm=T),
+           max_chl_conc=max(chl_a,na.rm=T),
+           min_chl_conc=min(chl_a,na.rm=T),
+           mean_chl_conc=mean(chl_a,na.rm=T),
+           var_chl_conc=var(chl_a,na.rm=T)
+           ) %>% 
+  ungroup()
+
+```
+
+
+
+
+# Figures
+
+```{r colored-time-series-with-bloomstat, fig.cap="Figure 1: Daily USGS water quality record at gage 06892350, Kansas River at Wamego.",fig.height=7}
+
+plot_base <- daily_3_gage_data %>% 
+  filter(site_name=="DeSoto_3") %>% 
+  mutate(bloom_stat_1_v=median_temperature/median_velocity) %>%
+  mutate(bloom_stat_2_q=median_temperature/median_discharge) %>% 
+  mutate(median_chl_mass=median_discharge*median_chl_conc) %>% 
+  select(date,bloom_stat_2_q,bloom_stat_1_v,median_chl_conc,median_nitrate,
+         median_discharge,median_velocity,median_temperature) %>% # bloomstats and 
+  ggplot(aes(x=date)) +
+  xlab(NULL)
+
+
+ribbon_chl <- plot_base +
+  geom_line(aes(y=median_chl_conc),color="darkgreen") +
+  geom_hline(yintercept = 30) +
+  ylab("chl-a\n(ug/l)")
+
+ribbon_bloomstat_q <- plot_base +
+  geom_line(aes(y=bloom_stat_2_q)) +
+  ylab("T/Q")
+
+ribbon_bloomstat_v <- plot_base +
+  geom_line(aes(y=bloom_stat_1_v)) +
+  ylab("temp/v")
+
+ribbon_N <- plot_base +
+   geom_line(aes(y=median_nitrate),color="brown") +
+  ylab("nitrate\n(mg/l)")
+  
+  
+  
+ribbon_q <- plot_base +
+  geom_line(aes(y=median_discharge),color="blue") +
+  # ylab("discharge\n(cms)")
+  ylab(bquote('discharge/n '(~m^3/s)))
+  # ylab(expression(discharge~SO[4]^{"2-"}~(ngm^-3))) + 
+    # ylab(expression("NO"[3]*"-N mg/L")
+    # ylab(expression("discharge\n("m^3))
+
+
+ribbon_temp <- plot_base +
+  geom_line(aes(y=median_temperature),color="red") +
+  ylab("temperature\n(C)")
+
+ribbon_N/
+ribbon_temp/
+ribbon_q/
+ribbon_chl/
+ribbon_bloomstat_q
+
+```
+
+
+```{r bloomstat-tryptych-facets, fig.cap="Figure 2: $T/Q$ serves as a better linear predictor of log(chl-a) ($R^2$= 0.44) than either discharge ($R^2$= 0.24) or temeprature ($R^2$= 0.063) alone."}
+
+plot_name_frame <- tribble(
+  ~name,~plot_name,
+  "bloomstat","1. T/Q",
+  "inverse_discharge","2. 1/discharge (s/m^3)",
+  "median_temperature","3. median temperature (C)"
+)
+
+daily_3_gage_data %>%
+  filter(site_name=="DeSoto_3") %>% 
+  select(median_chl_conc,median_nitrate,median_temperature,median_discharge) %>% 
+  mutate(bloomstat=median_temperature/median_discharge) %>% 
+  mutate(inverse_discharge=1/median_discharge) %>% 
+  select(-median_discharge) %>% 
+  pivot_longer(-c(median_chl_conc,median_nitrate)) %>% 
+  left_join(plot_name_frame) %>% 
+  ggplot(aes(
+    y=median_chl_conc,
+    x=value
+  )) +
+  geom_point(aes(
+  )) +
+  facet_wrap(~plot_name,scales = "free_x") +
+  geom_smooth(method="lm") +
+  scale_color_viridis_c() +
+  scale_y_log10() +
+  xlab(NULL) +
+  ylab("chl-a (ug/L)")
+
+```
+
+
+```{r get-model-numbers, include=FALSE}
+#inspect these for reported numbers in figure caption
+lm_data <- daily_3_gage_data %>%
+  filter(site_name=="DeSoto_3") %>% 
+  select(median_chl_conc,median_nitrate,median_temperature,median_discharge) %>% 
+  # select(median_chl_conc,median_nitrate,median_temperature,median_velocity) %>% 
+  # mutate(bloomstat_v=median_temperature/median_velocity) %>% 
+  mutate(bloomstat=median_temperature/median_discharge) %>% 
+  mutate(inverse_discharge=1/median_discharge)
+
+#full record
+lm(log(median_chl_conc) ~ median_temperature ,data=lm_data) %>% 
+  summary()
+
+lm(log(median_chl_conc) ~ inverse_discharge,data=lm_data) %>% 
+  summary()
+
+lm(log(median_chl_conc) ~ bloomstat,data=lm_data) %>% 
+  summary()
+
+#full below .35
+lm_data_below_35_good_performance <- lm_data %>% 
+  filter(bloomstat<.35)
+
+lm(log(median_chl_conc) ~ median_temperature ,data=lm_data_below_35_good_performance) %>% 
+  summary()
+
+lm(log(median_chl_conc) ~ inverse_discharge,data=lm_data_below_35_good_performance) %>% 
+  summary()
+
+lm(log(median_chl_conc) ~ bloomstat,data=lm_data_below_35_good_performance) %>% 
+  summary()
+
+
+#full above .35
+lm_data_above_35 <- lm_data %>% 
+  filter(bloomstat>.35)
+
+lm(log(median_chl_conc) ~ median_temperature ,data=lm_data_above_35) %>% 
+  summary()
+
+lm(log(median_chl_conc) ~ inverse_discharge,data=lm_data_above_35) %>% 
+  summary()
+
+lm(log(median_chl_conc) ~ bloomstat,data=lm_data_above_35) %>% 
+  summary()
+
+#find the chl-a for .35 T/Q
+t_q_model <- lm(log(median_chl_conc) ~ bloomstat,data=lm_data_below_35_good_performance)  
+tibble(bloomstat=.35) %>% 
+  predict(t_q_model,.)   %>% 
+  exp()
+
+#find T/Q for chl-a=30
+model_intercept <- t_q_model$coefficients[1]
+model_slope <- t_q_model$coefficients[2]
+threshold_t_q<- (log(30) - model_intercept) / model_slope
+
+tibble(bloomstat=threshold_t_q) %>% 
+  predict(t_q_model,.)   %>% 
+  exp()
+
+
+```
+
+```{r get-paper-numbers}
+days_with_chl_a_data <- lm_data %>% 
+  filter(!is.na(median_chl_conc))  %>% 
+  nrow()
+
+days_with_chl_a_data
+
+#days above 30 ug/L
+lm_data %>% 
+  filter(median_chl_conc > 30) %>% 
+  nrow()/days_with_chl_a_data
+
+#days above .3
+ lm_data %>% 
+  filter(bloomstat> .35) %>% 
+  nrow()/days_with_chl_a_data
+ 
+#numbers around break point
+lm_data %>% 
+  filter(bloomstat < .35) %>% 
+  pull(median_chl_conc) %>% 
+  summary()
+  
+```
+```{r confusion_matrix}
+  actual_values <- lm_data %>% 
+    mutate(bloom_days_bool=median_chl_conc > 30 ) %>% 
+    pull(bloom_days_bool) %>% 
+    as.factor()
+
+  predicted_values <- lm_data %>% 
+    mutate(bloom_days_bool=bloomstat > threshold_t_q ) %>% 
+    pull(bloom_days_bool) %>% 
+    as.factor()
+    
+  confusionMatrix(data=predicted_values,reference = actual_values,mode="everything",positive = "TRUE")
+  confusionMatrix(data=predicted_values,reference = actual_values)
+  # table(predicted_values,actual_values)
+```
+
+```{r n-limitation, fig.cap="Figure 3: Elevated chl-a always corresponded with low nitrate, suggesting that high chl-a draws down nitrate to limiting concentrations. It therefore appears that nitrate limitation and total nitrate loading set the upper limit of phytoplankton bloom magnitude."}
+plot_base <- daily_3_gage_data %>% 
+filter(site_name=="DeSoto_3") %>% 
+mutate(bloom_stat_1_v=median_temperature/median_velocity) %>%
+mutate(bloom_stat_2_q=median_temperature/median_discharge) %>% 
+mutate(median_chl_mass=median_discharge*median_chl_conc) %>% 
+# select(date,bloom_stat_q,bloom_stat_v,median_chl_conc) %>% #just bloomstats
+select(date,bloom_stat_2_q,bloom_stat_1_v,median_chl_conc,median_nitrate,
+       median_discharge,median_velocity,median_temperature) %>% # bloomstats and q and temp
+# select(date,bloom_stat,median_chl_conc,median_chl_mass) %>% 
+ggplot() +
+
+  scale_y_log10(limits=c(1,170)) 
+ 
+
+n_limitation_plot <- plot_base +
+  geom_point(aes(x=median_nitrate,y=median_chl_conc),color="brown") +
+  geom_smooth(aes(x=median_nitrate,y=median_chl_conc),method="lm") +
+  # geom_smooth(aes(x=median_nitrate,y=median_chl_conc)) +
+   # ylab("chl-a\n(ug/l)") +
+   ylab(NULL) +
+  xlab("nitrate\n(mg/L)")
+   #  scale_y_log10() 
+   # ylim(c(1,170)) +
+   # 
+
+
+bloom_stat_plot <- plot_base +
+  geom_point(aes(x=bloom_stat_2_q,y=median_chl_conc,
+                 color=median_nitrate)) +
+  geom_smooth(aes(x=bloom_stat_2_q,y=median_chl_conc)) +
+   ylab("chl-a\n(\u03BCg/L)") +
+   # ylab(NULL) +
+  # xlab("temperature/discharge") +
+  # xlab("bloomstat") +
+  xlab("T/Q") +
+  scale_color_viridis_c("median daily nitrate") +
+  # theme(legend.position = "bottom")
+  theme(legend.direction="horizontal" ,
+        legend.position = c(.65,.1))
+   #  scale_y_log10() +
+   # ylim(c(1,170)) 
+   # 
+
+bloom_stat_plot | n_limitation_plot 
+```
+
+
+```{r plot-bloomstat-exceedence, fig.cap="Figure 4: Probability of chl-a exceeding 30 ug/L when conditions equal or exceed $T/Q$ threshold values. Maximum threshold (.61) is the 95^th^ percentile of $T/Q$."}
+
+desoto_na_removed_data <- daily_3_gage_data %>% 
+  filter(site_name=="DeSoto_3") %>% 
+  filter(!is.na(median_chl_conc)) %>% 
+  mutate(bloom_stat_d=median_temperature/median_discharge) %>% 
+  mutate(bloom_stat_v=median_temperature/median_velocity) 
+
+#hacky function, specific for desoto data, prepped above
+#meant to be applied to a vector of bloomstat_thresholds
+compute_bloom_stat_excedence_desoto <- function(bloom_stat_thresh_arg,
+                                                chl_threshold_arg=30,
+                                                bloom_stat_type="discharge"){
+  
+  if(bloom_stat_type=="discharge"){
+   filtered_data <-  desoto_na_removed_data %>% 
+     filter(bloom_stat_d>=bloom_stat_thresh_arg)
+    }else{
+      if(bloom_stat_type=="velocity"){
+        filtered_data <-  desoto_na_removed_data %>% 
+          filter(bloom_stat_v>=bloom_stat_thresh_arg)
+       }else{
+        print("invalid bloomstat type! returning!")
+      return()
+       }
+    }
+    
+  bloom_stat_filtered_chl <- filtered_data %>% 
+     filter(!is.na(median_chl_conc)) %>% 
+     pull(median_chl_conc)
+  chl_n <- length(bloom_stat_filtered_chl)
+  above_thresh_n <- sum(bloom_stat_filtered_chl>chl_threshold_arg) 
+  excedence_prob <- above_thresh_n/chl_n
+  } 
+
+#limit exceedance to the 95th percentile, to ensure enough data at high end
+ #(if you go up to the t/q max, things get really noisy from low sample size)
+max_prob <- .95
+
+bloomstat_max_d <-desoto_na_removed_data %>% 
+  pull(bloom_stat_d) %>% quantile(na.rm=T,probs=max_prob)
+
+
+excedence_vector_length <- 1000
+bs_excedence_vector_d <- seq(
+  from=0,
+  to=bloomstat_max_d, #by inspection, very little data above .9, hand set to .9
+  length.out = excedence_vector_length
+)
+
+
+excedence_tibble_desoto <- tibble(bloom_stat_threshold_d=
+                             bs_excedence_vector_d)
+
+excedence_tibble_desoto <- excedence_tibble_desoto %>% 
+  rowwise() %>%
+  mutate(excedence_prob_d=
+           compute_bloom_stat_excedence_desoto(bloom_stat_threshold_d,bloom_stat_type = "discharge")
+         )
+
+excedence_tibble_desoto %>% 
+  ggplot() +
+  geom_line(aes(x=bloom_stat_threshold_d,y=excedence_prob_d)) +
+  geom_vline(aes(xintercept= threshold_t_q),linetype = "dashed") +
+  ylab("fraction of record exceeding 30 ug/L") +
+  xlab("T/Q threshold") +
+  ylim(c(0,1))
+                   
+```
+
+
+```{r bloom-stat-by-location-v2,fig.cap="Figure 5: Local regression between $T/Q$ and chl-a at 2 sites on the Kansas River, sepearated by 158 river kms."}
+
+plot_labels <- tribble(
+  ~site_name,~plot_name,
+  "Wamego_1","Wamego (upstream)",
+  "DeSoto_3","DeSoto (focal site)"
+)
+
+plot_data <- daily_3_gage_data %>%
+  filter(site_name!="Lake_Quivera_4") %>%
+  left_join(plot_labels) 
+
+
+plot_pal <- brewer.pal(3,"Dark2")
+
+plot_data %>% 
+  ggplot(aes(
+    y=median_chl_conc,
+    x=median_temperature/median_discharge
+  )) +
+    geom_point(data=
+               plot_data %>% filter(site_name=="DeSoto_3"),
+                  aes(    
+                     y=median_chl_conc,
+                      x=median_temperature/median_discharge
+                  ) ,
+             alpha=.5,
+             color=plot_pal[1]
+             ) +
+  geom_point(data=
+               plot_data %>% filter(site_name=="Wamego_1"),
+                  aes(    
+                     y=median_chl_conc,
+                      x=median_temperature/median_discharge
+                  ) ,
+             alpha=.5,
+            size=.9,          
+             color=plot_pal[2]
+             ) +
+# 
+  geom_smooth(aes(color=plot_name),method="gam") +
+  xlab("T/Q") +
+  ylab("chl-a (ug/L)") +
+  scale_color_brewer(palette = "Dark2","site") +
+  scale_y_log10() +
+  theme(legend.position=c(.8,.2)) +
+  scale_shape_discrete()
+
+```
+
+
+```{r exceedence-at-both-sites, fig.cap="Figure S1: Exceedance analysis at both the focal site (Desoto, green) and the second site 158 rkm upstream (Wamego, orange). Results are consistent with local regression analysis, where $T/Q$ has a saturating relationship with blooms at the downstream site but not the upstream site. At the upstream site, there is a positive and linear relationship across the whole range of $T/Q$ thresholds."}
+wamego_na_removed_data <- daily_3_gage_data %>% 
+  filter(site_name=="Wamego_1") %>% 
+  filter(!is.na(median_chl_conc)) %>% 
+  mutate(bloom_stat_d=median_temperature/median_discharge) %>% 
+  mutate(bloom_stat_v=median_temperature/median_velocity) 
+
+#hacky function from above, now specific for wamego
+  #apply to a vector of bloomstat_thresholds
+compute_bloom_stat_excedence_wamego <- function(bloom_stat_thresh_arg,chl_threshold_arg=30,bloom_stat_type="discharge"){
+  if(bloom_stat_type=="discharge"){
+   filtered_data <-  wamego_na_removed_data %>% 
+     filter(bloom_stat_d>=bloom_stat_thresh_arg)
+    }else{
+      if(bloom_stat_type=="velocity"){
+        filtered_data <-  desoto_na_removed_data %>% 
+          filter(bloom_stat_v>=bloom_stat_thresh_arg)
+       }else{
+        print("invalid bloomstat type! returning!")
+      return()
+       }
+    }
+    
+  bloom_stat_filtered_chl <- filtered_data %>% 
+     filter(!is.na(median_chl_conc)) %>% 
+     pull(median_chl_conc)
+  chl_n <- length(bloom_stat_filtered_chl)
+  above_thresh_n <- sum(bloom_stat_filtered_chl>chl_threshold_arg) 
+  excedence_prob <- above_thresh_n/chl_n
+  } 
+
+
+
+#use max threshold from desoto data stream for the wamego plot
+max_prob <- .95
+bloomstat_max_d <-desoto_na_removed_data %>% 
+  pull(bloom_stat_d) %>% quantile(na.rm=T,probs=max_prob)
+
+
+excedence_vector_length <- 1000
+bs_excedence_vector_d <- seq(
+  from=0,
+  to=bloomstat_max_d,
+  length.out = excedence_vector_length
+)
+
+
+#setup thresholds
+excedence_tibble_wamego <- tibble(bloom_stat_threshold_d=
+                             bs_excedence_vector_d)
+
+#apply exceedance analysis to threholds
+excedence_tibble_wamego <- excedence_tibble_wamego %>% 
+  rowwise() %>%
+  mutate(excedence_prob_d=
+           compute_bloom_stat_excedence_wamego(bloom_stat_threshold_d,bloom_stat_type = "discharge")
+         ) 
+
+plot_pal <- brewer.pal(3,"Dark2")
+excedence_plot_q <- excedence_tibble_wamego %>% 
+  ggplot() +
+  geom_line(aes(x=bloom_stat_threshold_d,y=excedence_prob_d),color=plot_pal[2]) +
+  ylab("probability of exceeding 30 ug/L") +
+  xlab("T/Q threshold") +
+  geom_line(
+    data=excedence_tibble_desoto,
+    aes(x=bloom_stat_threshold_d,y=excedence_prob_d),
+    color=plot_pal[1]
+  ) +
+  ylim(c(0,1)) 
+
+
+excedence_plot_q
+```
+
+```{r colored-time-series-with-bloomstat-wamego,fig.width=8.5,fig.height=5.5,fig.cap="Figure S2: Daily USGS water quality record at upstream site, gage 06887500, Kansas River at Wamego, 158 river kms upstream from our focal site.  Taxonomic analysis by the USGS established that like the downstream site, chl-a approximates phytoplankton biomass and not material scoured from benthic algal mats. The temporal chl-a dynamics are consistent with these findings, where chl-a is elevated for month long periods rather than as pulses following high discharge events. Further, the elevated chl-a periods initiate in the spring when temperature increases and are not coincindent with high discharge events. In general, the temporal dynamics of chl-a are very similar to the downstream site, including clear correspondence between chl-a and $T/Q$ throughout the year. Horizontal line in chl-a indicates bloom threshold, 30 $\\mu g/L$.",fig.height=7}
+
+plot_base <- daily_3_gage_data %>% 
+  filter(site_name=="Wamego_1") %>% 
+  mutate(bloom_stat_1_v=median_temperature/median_velocity) %>%
+  mutate(bloom_stat_2_q=median_temperature/median_discharge) %>% 
+  mutate(median_chl_mass=median_discharge*median_chl_conc) %>% 
+  # select(date,bloom_stat_q,bloom_stat_v,median_chl_conc) %>% #just bloomstats
+  select(date,bloom_stat_2_q,bloom_stat_1_v,median_chl_conc,median_nitrate,
+         median_discharge,median_velocity,median_temperature) %>% # bloomstats and q and temp
+  # select(date,bloom_stat,median_chl_conc,median_chl_mass) %>% 
+   
+  ggplot(aes(x=date)) +
+  xlab(NULL)
+
+
+ribbon_chl <- plot_base +
+  geom_line(aes(y=median_chl_conc),color="darkgreen") +
+  geom_hline(yintercept = 30) +
+  # scale_y_log10() +
+  ylab("chl-a\n(\u03BCg/L)")
+
+ribbon_bloomstat_q <- plot_base +
+  geom_line(aes(y=bloom_stat_2_q)) +
+  # ylab("temp/Q")
+  # ylab("bloomstat")
+  ylab("T/Q")
+
+ribbon_bloomstat_v <- plot_base +
+  geom_line(aes(y=bloom_stat_1_v)) +
+  ylab("temp/v")
+
+#can't figure out getting the label right! skipping it for this submission
+
+ribbon_q <- plot_base +
+  geom_line(aes(y=median_discharge),color="blue") +
+  ylab("discharge\n(cms)")
+
+ribbon_temp <- plot_base +
+  geom_line(aes(y=median_temperature),color="red") +
+  ylab("temperature\n(C)")
+
+
+#include comparrison
+# ribbon_N/
+# ribbon_temp/
+# ribbon_q/
+# ribbon_chl/
+# ribbon_bloomstat_q/
+# ribbon_bloomstat_v
+
+ribbon_temp/
+ribbon_q/
+ribbon_chl/
+ribbon_bloomstat_q
+
+
+ 
+```
+

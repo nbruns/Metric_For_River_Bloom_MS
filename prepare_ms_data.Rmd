@@ -1,0 +1,427 @@
+---
+title: "Data preperation for : Simple metric for predicting the timing of river phytoplankton blooms"
+author: "Nicholas Bruns"
+date: "02/25/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+This script creates an analysis ready dataset of real time water-quality measurements collected by the USGS at 4 sites along the mainstem of the Kansas River. The script: 
+
+1. makes velocity-stage rating curves for each site based on field measurements taken by the USGS 
+2. downloads real time water quality data (saved as the "raw data". 
+3. merges records when sensors are replaced, 
+4. snaps all parameters to the same rounded 15 minutes (i.e. converting lists by parameter to a single "wide" table where each parameter is a column, each row, a unique 15 minute interval. ) 
+5. Adds some derived values, including using the rating curves to estimate mean velocities 
+
+
+```{r setup}
+library(dataRetrieval)
+library(tidyverse)
+library(lubridate)
+library(viridis)
+```
+
+```{r set-globals}
+START_DATE <-"2012-07-26"
+END_DATE <- "2020-02-26"
+raw_data_file_name <- "gage_data_raw.RData"
+processed_data_file_name <- "gage_data_processed.RData"
+#4th, neweer site 06888990
+#kansas river at water plan
+# 4 sites along Kansas mainstem with real time water quality data
+# we will only use Wamego and DeSoto in manuscript, as they have the longest records
+# (8 year record)
+super_gage_sites <- tribble(~site_id, ~site_name,~position_number,
+  "06887500", "Wamego_1",1,
+  "06888990", "Topeka_water_plant_2",2,
+  "06892350", "DeSoto_3",3,
+  "06892518", "Lake_Quivera_4",4
+  )
+
+super_gage_parameters <- list(
+  discharge="00060", # Discharge, instantaneous, cubic feet per seconde
+  gage_height="00065",
+  chl_a_32318="32318",
+  chl_a_62361="62361",
+  turbidity="63680",
+  temperature="00010",
+  nitrate_suna="99133"
+)
+
+
+
+
+```
+Use the site measurements, provided by the USGS to make stage-velocity rating curves.
+
+```{r make_rating_curves}
+surface_meas_data_all_gages <- super_gage_sites%>% pull(site_id) %>%  map_dfr(readNWISmeas,expanded=TRUE) 
+glimpse(surface_meas_data_all_gages)
+surface_meas_data_all_gages <- surface_meas_data_all_gages %>% rename(site_id=site_no)
+surface_meas_data_all_gages <- surface_meas_data_all_gages %>% left_join(super_gage_sites,by="site_id")
+glimpse(surface_meas_data_all_gages)
+
+#inspect measurement numbers at the sites. 2 sites are old, 2 sites are young
+# measurement number should reflect differences in age
+surface_meas_data_all_gages %>% pull(site_id) %>% table()
+#they do! Great.
+
+
+fit_gage_velocity_curve <- function(cur_site_id,rating_start_date="1900-01-01"){
+  gage_data <- surface_meas_data_all_gages %>% 
+    filter(site_id==cur_site_id) %>% 
+    filter(measured_rating_diff=="Good") %>% 
+    filter(measurement_dt>rating_start_date) %>% 
+    filter(discharge_va>0) %>% 
+    filter(chan_velocity>0)
+  #test for na's
+  cur_power_law_model <-  lm( log( chan_velocity)~ log(discharge_va),data=gage_data)
+  cur_a <- exp(coef(cur_power_law_model)[1])
+  cur_b <- coef(cur_power_law_model)[2]
+  ret_vec <- c(cur_a,cur_b)
+  names(ret_vec) <-  c('rating_param_a','rating_param_b')
+  return(ret_vec)
+}
+
+
+site_id_vec <- super_gage_sites %>% pull(site_id) 
+
+#get fit parameters for the 4 sites
+site_covars <- site_id_vec %>%  map(fit_gage_velocity_curve,rating_start_date=START_DATE)
+site_covars <- do.call(rbind,site_covars)
+site_covars
+#attach these results to our site list
+super_gage_sites <- super_gage_sites %>% cbind(site_covars)
+super_gage_sites
+```
+
+```{r show_rating_curves}
+#plot rating curves and compare to measurements,  to test if rating curves seem reasonable
+surface_meas_data_all_gages <- surface_meas_data_all_gages %>% 
+  left_join(super_gage_sites %>% select(site_id,rating_param_a,rating_param_b),by="site_id")
+
+glimpse(surface_meas_data_all_gages)
+
+turn_stage_to_velocity <- function(x,fit_a,fit_b){
+  fit_a*(x^fit_b)
+}
+
+surface_meas_data_all_gages <-  surface_meas_data_all_gages %>% 
+  mutate(modeld_gage_velocity=turn_stage_to_velocity(discharge_va,fit_a=rating_param_a,fit_b=rating_param_b)) 
+
+
+#this plot for testing the fits and preds
+
+#NEB aside to NEB: ha! not the plot I wanted, but really reassuring, so keep it here
+surface_meas_data_all_gages %>% 
+   filter(measured_rating_diff=="Good") %>% 
+   filter(measurement_dt>START_DATE) %>% 
+  ggplot() + 
+  geom_point(aes(x=discharge_va,y=chan_velocity)) + 
+  geom_point(aes(x=discharge_va,y=modeld_gage_velocity),color="red") + 
+  facet_wrap(~position_number+ site_name,labeller = labeller(.multi_line = F)) +
+  scale_x_log10() +
+  scale_y_log10() +
+  ylab("velocity (f/s)") +
+  xlab("discharge (cf/s)")
+  
+```
+
+
+```{r download_data}
+
+build_concentration_list <- function(site_id_arg,parameter_list_arg){
+	ret_conc.list <- list()
+	for(i in 1:length(parameter_list_arg)){
+	  print("now downloading")
+	  print(names(parameter_list_arg)[i])
+	  
+	    ret_conc.list[[i]] <-  readNWISuv(
+	      siteNumbers=site_id_arg,
+	      parameterCd=parameter_list_arg[[i]],
+	      startDate=START_DATE,
+	      endDate=END_DATE
+	    )  %>%
+	      # renameNWISColumns %>% 
+	      mutate(parameter=names(parameter_list_arg)[i]) #Mutate just adds a new column to the data frame
+	} 
+	names(ret_conc.list) <- names(parameter_list_arg)
+	return(ret_conc.list)
+}
+
+# raw_data_file_name <- "../data/super_gage_data_raw.RData"
+
+if(file.exists(raw_data_file_name)){
+  print("super gage data was already downloaded, loading from disk")
+  load(raw_data_file_name)  
+}else{
+  print("super gage data not yet downloaded, so let's now download.")
+  super_gage_light_data_list <- list()
+  row_i <- 1
+  for(cur_site in super_gage_sites %>% pull(site_id)){
+    print("on the site #")
+    print(row_i)
+    print(cur_site)
+    cur_row_light_data <- build_concentration_list(cur_site,super_gage_parameters) 
+    super_gage_light_data_list[[row_i]] <- cur_row_light_data
+    row_i <- row_i + 1
+  }
+  names(super_gage_light_data_list) <- super_gage_sites %>% pull(site_id)
+  save(super_gage_light_data_list,file=raw_data_file_name)
+}
+
+
+```
+
+```{r inpect_names}
+#the turbidity is a special case that takes careful work! we know this, but let's double check all others are consistent
+names_inspection <- function(param_string){
+  map(super_gage_light_data_list,function(x){names(x[[param_string]])})
+}
+
+for(cur_name in names(super_gage_parameters)){
+  print("inspect name for:")
+  print(cur_name)
+  print(names_inspection(cur_name) )
+}
+
+names_inspection("turbidity")
+names_inspection("temperature")
+
+
+```
+
+
+```{r clean_up_download}
+
+
+##heavy duty helper function, used below, cleans up peculiarities in pulling data from USGS
+  #works for each site and each parameter 
+  #in particular, there is nuance in merging the records when a sensor for a particular parameter
+    #is replaced
+extract_join_frame <- function(cur_param_string,cur_site_chunk){
+   cur_param_code <- super_gage_parameters[[cur_param_string]] #bad practice! this is a global. At the least, prob should be capitalized...
+   ends_with_string <- paste(cur_param_code,"00000",sep="_")
+   cur_param_chunk <- cur_site_chunk[[cur_param_string]] 
+  if(nrow(cur_param_chunk)==0) {
+    print("this param is not at this site")
+    return(NULL)
+  }
+   cur_param_chunk <- cur_param_chunk %>%  
+     select(dateTime,ends_with(ends_with_string)) %>% 
+      mutate(dateTime=round_date(dateTime,unit="15 minutes"))
+  # regardless of param, turbidity or others, the time rounding creates a small number (~200/200k) of timedate duplicates
+  #remove the dupplicates! By taking the mean between the two.
+    cur_param_chunk <- cur_param_chunk %>% group_by(dateTime)  %>% 
+    summarise_all(
+          mean 
+    )
+  if(cur_param_string=="turbidity"){
+    #When USGS swaps out a sensor for the same paramter, the record has a several day gap, and no double counting
+    #The NWIS pull returns 2 columns, not 1, if they switched sensors for the same paramter code
+    # the names are different.
+    # the below code creates one merged column of values, but keeps record of which sensor using the returned column name
+   gathered_chunk <- cur_param_chunk %>% 
+     gather(ends_with(ends_with_string),key="turbidity_nwis_col_name",value = "turbidity") %>% 
+     filter(!is.na(turbidity))
+   return(gathered_chunk)
+  }else if(cur_param_string=="temperature"){
+    #turns out temerature is on the same sensor, same update logic as turbidity
+    gathered_chunk <- cur_param_chunk %>% 
+      gather(ends_with(ends_with_string),key="temperature_nwis_col_name",value = "temperature") %>% 
+      filter(!is.na(temperature))
+   return(gathered_chunk)
+    
+  }else{
+    #this logic assumes: you've now only got 2 columns... 
+    #not awesesome, and could quietley fail if new sites have the turbidity situation for other paramters, aka more than 1 way to call
+    cur_param_chunk <- cur_param_chunk %>% rename(!!cur_param_string :=2) #unsusual syntax recquired for using the variable name in rename syntax
+   return(cur_param_chunk) 
+  }
+}
+
+
+
+#quick helper function used below
+get_and_round_dates <- function(param_chunk,round_period=period("15 mins")){
+ round_date(param_chunk$dateTime ,unit = round_period)
+}
+
+#meant for use in a map(all_site_download_list) call, applying to each site entry
+#uses 2 helper function:
+  #-heavy weight, defined above, does the 
+  #-get_and_round_dates, declared at start of the chunk.
+create_site_time_series_frame <- function(site_data_chunk){
+  #below, I did all things assuming that the site id's in a column are all identical.
+  #therefore here, I pluck the first from the site_id column and use it throughout
+  cur_site_id <-site_data_chunk$discharge$site_no[1]
+  
+  all_dates <- map(site_data_chunk,get_and_round_dates)
+  
+  unique_date_vec <- unlist(all_dates) %>% unique() %>% as_datetime() %>% sort(decreasing=FALSE)  
+  date_root_vector <- seq(min(unique_date_vec),max(unique_date_vec),by="15 mins") # matt advice: make it a consistent time-index! build from here
+  
+  #ok! now build up the time_series_frame
+  time_series_frame <- tibble(dateTime=date_root_vector,site_id=cur_site_id)
+  for(cur_param_string in names(super_gage_parameters)){
+    print(cur_param_string)
+    cur_join_frame <- extract_join_frame(cur_param_string = cur_param_string,site_data_chunk)
+    #returns null instead of a dataframe if that param is not at the site
+    if(!is_null(cur_join_frame)){
+      time_series_frame <- time_series_frame %>% left_join(cur_join_frame)
+    }
+  }  
+  return(time_series_frame) 
+}
+
+
+#try on site 1 to see how this all works
+site_one_from_func <- create_site_time_series_frame(super_gage_light_data_list[[1]])
+summary(site_one_from_func)
+glimpse(site_one_from_func)
+
+#great, now apply to all sites!
+time_series_all_sites_list <- map(super_gage_light_data_list,create_site_time_series_frame)
+glimpse(time_series_all_sites_list)
+
+#to convince yourself this all worked, make a quick plot.
+plot_frame <- time_series_all_sites_list %>% map_dfr(rbind) %>% gather(names(super_gage_parameters),key="measurement",value="value")
+glimpse(plot_frame)
+#this shows everything! Very slow to plot on my machine, but shows everything and so is a nice sanity checking. 
+#if failing on your machine, skip it
+ggplot(plot_frame) + geom_line(aes(x=dateTime,y=value,col=site_id)) + facet_wrap(~measurement, scales="free") + scale_y_log10()
+```
+Use the rating curves to make an estimated velocity column using discharge and rating curve parameters.
+```{r attach_velocity}
+site_attach_velocity <- function(site_time_series_frame){
+  cur_site_id <- site_time_series_frame$site_id[1]
+  cur_site_info <- super_gage_sites %>% filter(site_id==cur_site_id)
+  #below complex call in word: we fit a rating curve above and attached the paramters to the site enumeration.
+  # here, we'll use those parameters to get modeled velocities from discharge at our sites
+  site_time_series_frame <- site_time_series_frame %>% 
+    mutate(modeled_velocity= turn_stage_to_velocity(discharge, 
+                                                    fit_a= cur_site_info$rating_param_a, 
+                                                    fit_b= cur_site_info$rating_param_b)) %>% 
+    mutate(modeled_velocity =modeled_velocity*.305) #convert from f/s to m/s
+  return(site_time_series_frame)    
+}
+
+#check that it worked
+chunk_with_velocity <- site_attach_velocity( time_series_all_sites_list[[1]])
+glimpse(chunk_with_velocity)
+ggplot(chunk_with_velocity) + geom_point(aes(x=discharge,y=modeled_velocity))
+
+#now apply to all
+glimpse(time_series_all_sites_list)
+time_series_all_sites_list <- map(time_series_all_sites_list,site_attach_velocity)
+glimpse(time_series_all_sites_list)
+
+```
+```{r convert_gage_heigh_to_meters}
+site_convert_ft_to_meters <- function(cur_site){
+  #unit story:
+    # given:ft
+    # need: m
+    #so: (multiply by m/ft, .3048)
+  cur_site <- cur_site %>% 
+    mutate(gage_height= gage_height * 0.3048)
+}
+
+inspect_gage_height <- function(cur_site){
+  cur_site %>% pull(gage_height) %>% 
+    summary()
+}
+print("before unit converstion")
+map(time_series_all_sites_list,inspect_gage_height)
+time_series_all_sites_list <- map(time_series_all_sites_list,site_convert_ft_to_meters)
+map(time_series_all_sites_list,inspect_gage_height)
+```
+
+
+```{r convert_discharge_to_meters_per_second}
+#
+site_convert_discharge_units_fps_to_mps <- function(cur_site){
+  #unit story:
+    # given: (ft^3/sec)
+    # need: (m^3/sec)
+    #so: (divide by 35.3147 - cubic ft in a cubic meter) (4 decimal places are reported out by google)
+ cur_site <- cur_site %>% 
+   mutate(discharge=discharge/35.3147)
+}
+
+inspect_discharge <- function(cur_site){
+  cur_site %>% pull(discharge) %>% 
+    summary()
+}
+
+print("before")
+map(time_series_all_sites_list,inspect_discharge)
+time_series_all_sites_list <- map(time_series_all_sites_list,site_convert_discharge_units_fps_to_mps)
+print("after")
+map(time_series_all_sites_list,inspect_discharge)
+#Good, these by eye all match expected magnitudes in cms
+```
+
+Chl-a arrives under 2 parameter codes. Merge these into a single column while keeping a record of the original parameter code
+
+```{r merge_chl_records}
+site_merge_chl_records <- function(site_time_series_frame){
+  #do a rejoin to the dataframe using gather functionality!
+  chl_join_frame <- site_time_series_frame %>% gather(starts_with("chl_a"),key="chl_a_param_cd",value="chl_a") %>% 
+    select(dateTime,chl_a,chl_a_param_cd) %>% 
+    filter(!is.na(chl_a))
+  #now, drop the old chlorophyll, replace with this new
+  # logic assumes double counting. See above note on turbidity: 
+    # when replacing a sensor, USGS seems to publish a gap between the 2 records
+    # or, there is no period with data from both sensors (overlap)
+  site_time_series_frame <- site_time_series_frame %>% select(-starts_with("chl_a")) %>% 
+    left_join(chl_join_frame)
+ return(site_time_series_frame) 
+}
+glimpse(time_series_all_sites_list[[1]])
+
+#quickly try on one chunk!
+chunk_with_chl_fixed <- site_merge_chl_records( time_series_all_sites_list[[1]])
+glimpse(chunk_with_chl_fixed)
+summary(chunk_with_chl_fixed)
+
+chunk_with_chl_fixed %>% filter(!is.na(chl_a)) %>% 
+  pull(chl_a_param_cd) %>% table()
+
+chunk_with_chl_fixed %>% 
+  ggplot() + 
+  geom_line(aes(x=dateTime,y=chl_a,color=chl_a_param_cd))
+
+time_series_all_sites_list <- map(time_series_all_sites_list,site_merge_chl_records)
+glimpse(time_series_all_sites_list)
+```
+
+```{r compute_chl_flux}
+glimpse(time_series_all_sites_list)
+rm(time_series_frame)
+site_compute_chl_flux <- function(site_time_series_frame){
+  #unit conversion story:
+    # desire: g/second
+    # given: m^3 * ug/l
+    # must: (10^3 liters in a m^3) * (10^-6 ug in a gram) = 10^-3
+  site_time_series_frame %>% mutate(chl_mass=discharge*chl_a*0.001) #m^3 * ug/l, 
+}
+
+#quickly inspect how this works for a single site
+site_compute_chl_flux(time_series_all_sites_list[[1]]) %>% 
+  ggplot() + geom_line(aes(x=dateTime,y=chl_mass))
+
+
+#looks good, apply to all
+time_series_all_sites_list <- map(time_series_all_sites_list,site_compute_chl_flux)
+glimpse(time_series_all_sites_list)
+map(time_series_all_sites_list,summary)
+map(time_series_all_sites_list,names)
+
+```
+```{r save_processed_data_frame}
+save(time_series_all_sites_list,file=processed_data_file_name)
+```
+
